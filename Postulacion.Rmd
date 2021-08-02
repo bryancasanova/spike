@@ -1,0 +1,499 @@
+---
+title: "Postulación Spike"
+author: "Bryan Casanova"
+date: "01/Agosto/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Carga de librerias y datos
+
+```{r carga, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(firatheme)
+library(corrplot)
+library(caret)
+library(Boruta)
+library(randomForest)
+
+precip <- read.csv("https://raw.githubusercontent.com/SpikeLab-CL/desafio_spike_precios/main/precipitaciones.csv") %>% as_tibble()
+banco <- read.csv("https://raw.githubusercontent.com/SpikeLab-CL/desafio_spike_precios/main/banco_central.csv") %>% 
+  as_tibble() 
+leche <- read.csv("https://raw.githubusercontent.com/SpikeLab-CL/desafio_spike_precios/main/precio_leche.csv") %>% as_tibble()
+
+```
+
+## Análisis de datos
+
+### Precipitación
+
+Primero voy a visualizar las bases de datos para ver qué información tienen y en qué formato. Empezaré por los datos de precipitación
+```{r ver datos precipitacion}
+precip
+```
+Vemos que tiene una columna con la fecha, y los datos de precipitación para 8 regiones. Dado que la columna date se leyó como factor, la transformaré a formato fecha. Además voy a ordenar los datos por fecha desde los más antiguos a los más nuevos y eliminaré posibles filas repetidas. Finalmente, para facilitar la visualización y el código, acortaré el nombre de algunas columnas
+
+```{r paso a fecha}
+precip <- precip %>% 
+  mutate(date = ymd(date)) %>% 
+  arrange(date) %>% 
+  distinct() %>% 
+  rename(Metropolitana = Metropolitana_de_Santiago,
+         OHiggins= Libertador_Gral__Bernardo_O_Higgins)
+```
+
+Ahora realizaré un pequeño análisis exploratorio: Comenzaré contanto la cantidad de datos no nulos que se dispone por region
+
+```{r contar datos precipitacion}
+precip %>% 
+    gather(key = region, value = value, -date) %>% 
+    group_by(region) %>% 
+    filter(!is.na(value)) %>% 
+    count() 
+```
+
+Entonces, se cuenta con 496 datos de precipitaciones mensuales para las 8 regiones.
+
+Ahora veré el rango de fechas con el que se cuenta datos. 
+
+```{r rango fechas precip}
+precip %>% 
+  pull(date) %>% 
+  range()
+```
+
+Por lo tanto se tienen datos de precipitación desde el año 1979 a abril 2020, lo que corresponde a los 496 datos de precipitación mensual para cada región
+
+
+Ahora visualizaré la distribución de las precipitaciones por región por medio de un histograma. Nótese que las escalas de ambos ejes son independientes para cada región.
+```{r histograma pp}
+precip %>% 
+  gather(key = region, value = value, -date) %>% 
+  ggplot(aes(x = value, color = region)) + 
+    geom_histogram(bins = 100) + 
+    theme_fira() + 
+    facet_wrap(region ~., scales = "free") + 
+    labs(x = "", y = "") + 
+    theme(legend.position = "none")
+```
+
+Se observa que la mayoría de las distribuciones son log normal, la cual es común de encontrar al analizar variables naturales o ambientales, y que existen mayores precipitaciones en las regiones del sur del país en comparación a las de la zona norte.
+
+
+### Banco central
+
+Replicaré los pasos anteriores con los datos del banco central, comenzando entonces por visualizar los datos.
+
+```{r ver datos banco}
+banco
+```
+
+Se observa que tiene una columna de fechas, llama Periodo, que fue leída como factor. Al mismo tiempo posee otras 84 columnas númericas, aún cuando la gran mayoría de ellas fueron leídas como factor.
+
+Comenzaré por crear una columna date, para que coincida con los datos de precipitación, en formato fecha. Además eliminaré filas duplicadas y la columna No_sabe__No_responde_Miles_de_personas dado que no es un indicador económico y no sabría como interpretar su relación con el precio de leche
+
+```{r banco a fecha}
+banco <- banco %>% 
+  mutate(date = ymd_hms(Periodo)) %>% 
+  select(-No_sabe__No_responde_Miles_de_personas) %>% 
+  distinct() 
+```
+
+Al generar esta nueva columna se produce un error en una de las filas, por lo que veremos por qué ocurrió:
+
+```{r banco error fecha}
+banco %>% 
+  filter(is.na(date)) %>% 
+  select(Periodo, date)
+```
+
+El error se produjo porque dicha fecha está en un formato erróneo ya que tiene un mes 13. Dado que no podemos saber con certeza a qué fecha corresponden dichos datos, estos serán eliminados. Al mismo tiempo, transformaré el resto de las columnas que tiene formato factor a numérico. Para ello, eliminaré todos los puntos, que asumiré que son separadores de miles
+
+```{r banco transformar factores, warning = FALSE}
+banco <- banco %>% 
+  filter(!is.na(date)) %>% 
+  select(-Periodo) %>% #elimino la columna periodo
+  select(date, everything()) #dejo la columna date al comienzo
+
+banco <- banco %>% 
+  select_if(negate(is.factor)) %>% # Selecciono las columnas que no son factor
+  cbind(banco %>%  #Junto esas columnas seleccionadas con
+              select_if(is.factor) %>%  #Las columnas que si son factor
+              mutate_all(~as.numeric(str_remove_all(as.character(.x), '\\.')))) # y que convierto a character, elimino los puntos, y finalmente transformo a numérico.
+```
+
+Al realizar la conversión a dato numérico aparecen varias advertencias dado que se generaron muchos valores NA, por lo que contaré la cantidad de datos no nulos que se dispone por variable. Guardaré este objeto para poder utilizarlo más adelante para filtrar las variables que consideraré en la base de datos final para realizar el modelo.
+
+```{r contar datos banco}
+contarbanco <- banco %>% 
+    gather(key = variable, value = value, -date) %>% 
+    group_by(variable) %>% 
+    filter(!is.na(value)) %>% 
+    count() %>% 
+    arrange(desc(n))
+
+contarbanco
+```
+
+Se observa que hay una amplia variabilidad en la disponibilidad de información, donde solo 3 variables poseen datos para las 611 fechas. En el otro extremo, existen 4 variables con solo 82 observaciones.
+
+Ahora veré el rango de fechas con el que se cuenta datos. 
+
+```{r rango fechas banco}
+banco %>% 
+  pull(date) %>% 
+  range()
+```
+
+Es decir en esta base de datos se cuenta con 50 años y 11 meses de datos lo que equivale a 611 meses.
+
+Finalmente, ahora revisaré la distribución de las 6 variables con mayor cantidad de observaciones mediante un histograma
+
+```{r histograma banco, warning=FALSE}
+top_6 <- banco %>% 
+    gather(key = variable, value = value, -date) %>% 
+    group_by(variable) %>% 
+    filter(!is.na(value)) %>% 
+    count() %>% 
+    arrange(desc(n)) %>% 
+    head(6) %>% 
+    pull(variable)
+banco %>% 
+  select(date, all_of(top_6)) %>% 
+  rename(Precio_oro = Precio_de_la_onza_troy_de_oro_dolaresoz,
+         Precio_plata = Precio_de_la_onza_troy_de_plata_dolaresoz,
+         Precio_cobre = Precio_del_cobre_refinado_BML_dolareslibra,
+         Precio_gasolina = Precio_de_la_gasolina_en_EEUU_dolaresm3,
+         Tipo_cambio = Tipo_de_cambio_del_dolar_observado_diario,
+         Precio_petroleo = Precio_del_petroleo_WTI_dolaresbarril) %>% 
+  gather(key = variable, value = value, -date) %>% 
+  ggplot(aes(x = value, color = variable)) + 
+    geom_histogram(bins = 100) + 
+    theme_fira() + 
+    facet_wrap(variable ~., scales = "free") + 
+    labs(x = "", y = "") + 
+    theme(legend.position = "none",
+          strip.text.x = element_text(size = 8))
+```
+
+
+Se observa que estas variables presentan una distribución bimodal, donde en la mayoría se observa una concentración importante de observaciones con un valor cercano a 0.
+
+### Precio de la leche
+
+Una vez más, replicaré los pasos anteriores con los datos del precio de la leche, comenzando por visualizar los datos.
+
+```{r ver datos leche}
+leche
+```
+
+En este caso es necesario juntar la columna Anio, mes y el día 01 para generar una columna en formato fecha, la cual se llamará date para que coincida con la de las bases de datos anteriores.
+Para ello sera necesario llevar la columna Mes a un número entre 1 y 12, o a los nombres de los meses en inglés para que puedan ser reconocidos.
+
+```{r transformacion fecha leche}
+meses <- data.frame(Mes = c("Ene", "Feb", "Mar", "Abr", "May", "Jun",
+                            "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"),
+                    N = 1:12)
+
+leche <- leche %>% 
+  left_join(meses, by = "Mes") %>% 
+  mutate(date = paste(Anio, N, 01, sep = "-"),
+         date = ymd(date)) %>% 
+  select(date, Precio_leche)
+leche
+```
+Ahora contaré la cantidad de fechas para las que se cuenta con información del precio de la leche
+
+```{r contar datos leche}
+leche %>% 
+    filter(! is.na(Precio_leche)) %>% 
+    count() 
+```
+
+Entonces, se cuenta con datos del precio de la leche para las 506 fechas, cuyo rango veré ahora
+
+```{r rango fechas leche}
+leche %>% 
+  pull(date) %>% 
+  range()
+```
+
+Por lo tanto, se tienen datos del precio de la leche desde el año 1979 a febrero 2020.
+
+Ahora visualizaré la distribución del de esta variable por medio de un histograma. 
+
+```{r histograma lechex}
+leche %>% 
+  ggplot(aes(x = Precio_leche)) + 
+    geom_histogram(bins = 100, col = "black", fill = "gray70") + 
+    theme_fira() + 
+    scale_x_continuous(breaks = seq(0, 300, 50)) + 
+    labs(x = "Precio_leche", y = "N de fechas") 
+```
+
+En este caso se observa una distribución multimodal, con modas cercanas a 0, 100 y a 200 pesos.
+
+
+## Visualización
+
+### Serie de tiempo por region
+
+```{r funcion TS pp}
+plot_pp <- function(region = NULL, inicio = NULL, fin = NULL){
+ regiones <- names(precip)[-1]
+ fechas <- precip %>% 
+   pull(date) %>% 
+   unique() %>% 
+   as.character()
+ 
+ if (as.Date(inicio) > as.Date(fin)){
+   inicio2 <- inicio
+   inicio <- fin
+   fin <- inicio2
+ }
+ 
+ if (! region %in% regiones){
+   return("La región escogida no está en el dataset")
+ } else if (! inicio %in% fechas | ! fin %in% fechas){
+   return("La fecha de inicio y/o final escogida no está en el dataset")
+ } else{
+   precip %>% 
+      filter(date >= inicio, date <= fin) %>% 
+      ggplot(aes_string(x = "date", y = region)) + 
+      geom_point(alpha = 0.5) + 
+      geom_smooth(se = F, method = "loess", span = 0.1, formula = "y ~ x") +
+     # geom_smooth(se = F, method = "lm") + 
+      theme_fira() + 
+      labs(x = "Fecha", y = "Precipitación mensual (mm)", title = region)  
+ }
+}
+
+# Probando con la región mal escrita
+plot_pp(region = "Ohiggins", inicio = "2000-01-01", fin = "2020-01-01")
+```
+
+Probando una fecha incorrecta
+```{r error plot fecha}
+plot_pp(region = "OHiggins", inicio = "2000-01-10", fin = "2020-01-01")
+```
+
+Serie de tiempo región de Ohiggins
+```{r  plot OHiggins}
+plot_pp(region = "OHiggins", inicio = "2000-01-01", fin = "2020-01-01")
+```
+
+Serie de tiempo región Metropolitana
+```{r  plot RM}
+plot_pp(region = "Metropolitana", inicio = "2000-01-01", fin = "2020-01-01")
+```
+
+En ambas series de tiempo se observa en primer lugar, que en la región de OHiggins se alcanzan precipitaciones ligeramente superiores a las de la región metropolitana. Por otra parte, en ambas figuras se observa una estacionalidad donde las precipitaciones se concentran en los meses de invierno. Finalmente, es posible visualizar una disminución en las precipitaciones alcanzadas durante los meses de invierno con el transcurso de los años.
+
+### Serie de tiempo para años seleccionados
+
+```{r funcion TS pp por anio}
+plot_pp_anios <- function(region = NULL, anios = NULL){
+ regiones <- names(precip)[-1]
+ anios_todos <- precip %>% 
+   pull(date) %>% 
+   year() %>% 
+   unique() %>% 
+   as.character()
+ 
+ anios <- anios %>% as.character()
+ 
+ if (! region %in% regiones){
+   return("La región escogida no está en el dataset")
+ } else if (sum(! anios %in% anios_todos) > 0){
+   return("No se cuenta con datos para al menos uno de los años escogidos")
+ } else{
+   precip %>% 
+      mutate(year = year(date),
+             mes = month(date)) %>% 
+      filter(year %in% anios) %>% 
+      mutate(date2 = ymd(paste(2000, mes, "01", sep = "-"))) %>% #Genero una fecha falsa para el gráfico, en la que todas las fechas se encuentran dentro del año 2000 (bisiesto)
+      ggplot(aes_string(x = "date2", y = region)) + 
+      geom_point(alpha = 0.5) + 
+      geom_line() +
+      facet_grid(year ~.) + 
+      theme_fira() + 
+      scale_x_date(breaks = "1 month", 
+               labels = scales::date_format("%b")) + 
+      labs(x = "Fecha", y = "Precipitación mensual (mm)")  
+ }
+}
+
+# Probando con año no inlcuido
+plot_pp_anios(region = "OHiggins", anios = c(2010,2011,2022))
+```
+
+```{r  plot Maule}
+plot_pp_anios(region = "Maule", anios = c(1982, 1992, 2002, 2012, 2019))
+```
+
+Al observar estas series de tiempo se observa que las mayores precipitaciones se concentran entre los meses de mayo y agosto. Por otra parte, se observa una disminución en las precipitaciones alcanzadas en la región del Maule, ya que hasta el año 2002 se alcanzaron meses con precipitaciones acumuladas sobre 400 mm, mientras que durante el año 2012 solo se llegó a una precipitación cercana a los 300 mm durante junio, y ya durante el 2019 los meses con mayores precipitaciones solo se acercaron a los 200 mm.
+
+### Series temporales PIB
+
+```{r  funcion PIB, warning=FALSE}
+# La función tendrá por defecto a la fecha actual como fecha de término.
+
+plot_pp <- function(series = NULL, inicio = NULL, fin =  Sys.Date()){
+banco %>% 
+    select(date, all_of(series)) %>% 
+    filter(date >= inicio, date <= fin) %>% 
+    gather(variable, value, -date) %>% 
+    ggplot(aes(x = date, y = value)) + 
+      geom_point(alpha = 0.5) + 
+      geom_line() +
+      facet_grid(variable ~., scale = "free_y") + 
+      theme_fira() + 
+      theme(strip.text.y.right = element_text(size = 7)) + 
+      labs(x = "Fecha", y = "Variable")  + 
+      scale_x_datetime(breaks = "1 year", 
+               labels = scales::date_format("%Y")) 
+}
+
+# Pruebo la función
+series <- c("PIB_Agropecuario_silvicola", "PIB_Servicios_financieros")
+inicio <- "2013-01-01"
+plot_pp(series = series, inicio = "2013-01-01")
+```
+
+Al observar la serie temporal del PIB Agropecuario Silvícola se observa que esta presenta un comportamiento estacional con máximos durante los veranos. Por otra parte, el PIB de servicios financieros presenta una estacionalidad menos marcada, donde también se alcanzan los máximos en verano, y además muestra una tendencia ascendente constante desde el 2013 en adelante. Ambas series de tiempo presentan valores que podrían ser erróneos, ya que se observan disminuciones puntuales abruptas, sin embargo, desconozco si estas variaciones son naturales en este tipo de variables y en honor al tiempo, voy a considerar que son válidas. 
+Por otra parte, dado que ambas series temporales tienden a aumentar durante la época estival, estas deben presentar una relación directa, lo cuál debiese estudiarse mediante un test de correlación, lo cual se abordará en la siguiente sección.
+
+## Tratamiento y creación de variables
+
+La correlación se puede evaluar aplicando algún test como el de pearson o spearman donde se obtiene un valor entre -1 y 1,  en donde los valores positivos representan una correlación directa, y los valores negativos señalan una correlación inversa. En ambos casos, mientras el valor sera más lejano de 0 indicará una correlación más fuerte, sin embargo, esta es una medida de la relación lineal que existe entre dos variables, y por lo tanto métodos de machine learning, que consideran otros tipos de relaciones, pueden llegar a ajustes altos en base a variables que tienen una correlación no necesariamente tan alta con la variable a predecir, y a las interacciones que se dan entre ellas.
+
+A la hora de entrenar un modelo, el primer paso es definir cuál será la variable a predecir, que en este caso es el precio de la leche. Luego, se deben recopilar distintas variables predictoras que tienen o podrían tener una relación con la variable a predecir. Actualmente, usualmente hay acceso a una variedad importante de variables que podrían utilizarse, en cuyos casos se debe aplicar un proceso de selección de variables o feature selection, los cuales nos permiten identificar aquellas variables que más aportan a mejorar la precisión del modelo. Al mismo tiempo, es importante tener un conocimiento de base o background de lo que se está modelando, de manera de tener al menos una noción de que el rango de valores con los que se cuentan son los suficientes para hacer un modelo robusto ante aplicaciones en sets de datos diferentes.
+
+Ahora realizaré el merge de los datos y la creación de nuevas variables que podrían ayudar a la predicción del precio de la leche, tales como valores medios del PIB, Imacec y precipitaciones, y los lags o diferencia de los valores con respecto al valor anterior. En el caso de los datos del banco central, solo consideraré las variables que cuenten con 200 datos válidos o más, con el fin de quedarme con una buena cantidad de filas u observaciones para darle más robustez a la modelación.
+
+Adicionalmente se hará un test de correlación con algunas variables a modo de ejemplo. Para ello realicé una búsqueda rápida en Google donde encontré un [artículo](https://blog.especialistasennovillas.es/posts/el-precio-de-la-leche.aspx) que menciona un dato que desconocía que se refiere a la relación existente entre el precio del petroleo y el precio de la leche, por lo tanto ahora veré si esta correlación se cumple en nuestro set de datos.
+
+```{r merge}
+seleccion_banco <- contarbanco %>% 
+  filter(n > 200) %>% 
+  pull(variable)
+
+bdfinal <- leche %>% 
+  left_join(banco %>% 
+                mutate(Media_PIB = rowMeans(select(., starts_with("PIB")), na.rm = TRUE),  #Agrego PIB medio
+                       Media_Imacec = rowMeans(select(., starts_with("Imacec")), na.rm = TRUE),
+                       Media_PIB_lag = Media_PIB - lag(Media_PIB, default = 0), #Calculo diferencia del PIB medio con respecto a la medición anterior
+                       Media_Imacec_lag = Media_Imacec - lag(Media_Imacec, default = 0), #Calculo diferencia del IMACEC medio con respecto a la medición anterior
+                       PIB_lag = PIB - lag(PIB, default = 0),#Calculo diferencia del PIB con respecto a la medición anterior
+                       PetroleoWTI_lag = Precio_del_petroleo_WTI_dolaresbarril - lag(Precio_del_petroleo_WTI_dolaresbarril, default = 0), #Lag petroleo WTI
+                       PetroleoBrent_lag = Precio_del_petroleo_Brent_dolaresbarril - lag(Precio_del_petroleo_Brent_dolaresbarril, default = 0)) %>% #Lag petroleo Brent
+              select(date, all_of(seleccion_banco)), 
+                by = "date") %>% 
+  left_join(precip %>% 
+                mutate(Media_PP = rowMeans(select(., -date), na.rm = TRUE), #Agrego precipitación media
+                       Media_PP_lag = Media_PP - lag(Media_PP, default = 0)), #Calculo diferencia de la precipitación con medición anterior
+                by = "date") %>% 
+  mutate(anio = year(date), #creo columna con el año
+         month = month(date), #creo columna con el mes
+         week = week(date), #creo columna con la semana
+         semestre = semester(date), #creo columna con el semestre
+         trimestre = quarter(date)) %>%  #creo columna con el trimestre
+  na.omit()
+
+bdfinal %>% 
+  select(Precio_leche, Petroleo_WTI = Precio_del_petroleo_WTI_dolaresbarril, Petroleo_Brent = Precio_del_petroleo_Brent_dolaresbarril, Precio_gasolina = Precio_de_la_gasolina_en_EEUU_dolaresm3) %>% 
+  cor(use = "pairwise.complete.obs") %>%
+  corrplot(method = 'number', diag = FALSE)
+```
+
+En la figura se observa que en este set de datos también existe una correlación importante entre el precio de la leche y el precio del petroleo, sobre todo en su medición Brent (r = 0.53). Por otra parte, su relación con el precio de la gasolina es bastante más sutil (r = 0.3).
+
+## Modelo
+
+De forma previa al modelo realizaré algunos pasos de preprocesamiento: En primer lugar voy a identificar si existen variables con poca variabilidad dentro del set de datos con el fin de no considerarlas, estoy lo voy a realizar por medio de la función nearZeroVar de la librería caret.
+
+
+```{r near zero var}
+nzv <- nearZeroVar(bdfinal)
+nzv
+```
+
+De acuerdo a este análisis, no existe ninguna variable con poca o nula variabilidad y por lo tanto, no eliminaré ninguna de nuestro set de datos.
+
+Por otra parte, realizaré una estandarización de los predictores, dado que no estoy seguro de los datos del banco central esten en las unidades correctas ya que eliminé los puntos que se habían leído en un comienzo, y de esta manera todas las variables tendrán una media 0 y desviación estándar 1, con la excepción de la fecha y el precio de la leche
+
+```{r scaling}
+bdfinal <- bdfinal %>% 
+  select(date, Precio_leche) %>% 
+  cbind(bdfinal %>% 
+          select(-date, -Precio_leche) %>% 
+          mutate_all(scale))
+   
+```
+
+Ahora realizaré un proceso de feature selection llamado Boruta, ya que se basa en un algoritmo de Random Forest, el cual utilizaremos para finalmente modelar el precio de la leche. Este proceso separa todas las columnas de la base de datos en 3 categorías: Importantes, posibles o tentativos y sin importancia. En el caso de este ejercicio me quedaré solo con las variables importantes.
+
+```{r Boruta}
+boruta_output <- Boruta(Precio_leche ~ ., data=bdfinal, doTrace=0, maxRuns = 50)  
+boruta_signif <- getSelectedAttributes(boruta_output, withTentative = FALSE)
+boruta_signif
+```
+
+Dentro de las variables seleccionadas se encuentran múltiples indicadores económicos, tales como el precio del oro, plata, gasolina, petroleo, entre otros, y diversos indicadores del IMACEC. En cuanto a las precipitaciones, solo selecciona las precipitaciones de las regiones de Biobio y Los Ríos, lo cual tiene sentido ya que en dicha zona es donde se concentra la producción de leche en el país, y se podría asumir que la precipitación está relacionada a la disponibilidad, y con ello al costo, del alimento para las vacas.
+
+Ahora separaré la base de datos entre entrenamiento y validación. Para ello realizaré una separación aleatórea de un 70% para entrenamiento y 30% para validación, dado que finalmente se cuenta con 244 observaciones. El porcentaje suelo decidirlo en base a la cantidad de datos con los que dispongo, donde sobre las 1000 observaciones ya utilizo un 80% para entrenamiento. 
+
+```{r modelo, warning=FALSE}
+bdfinal <- bdfinal %>% 
+  select(Precio_leche, all_of(boruta_signif))
+
+set.seed(1234) #creo semilla para que sea reproducible
+trainIndex <- createDataPartition(bdfinal$Precio_leche, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+train <- bdfinal[ trainIndex,]
+test  <- bdfinal[-trainIndex,]
+
+rf <- randomForest(Precio_leche ~ ., data = train)
+
+test <- test %>% 
+  select(date, Precio_leche) %>% 
+  mutate(Prediccion = predict(rf, test)) 
+```
+
+En primer lugar realizaremos un análisis visual de la calidad de la prediccción al comparar la serie de tiempo del precio de la leche real versus el resultado del modelo
+
+```{r plot modelo, warning=FALSE}
+test %>% 
+  gather(variable, value, -date) %>% 
+  ggplot(aes(x = date, y = value)) + 
+    geom_point() + 
+    theme_fira() + 
+    facet_grid(variable~.) + 
+    scale_x_datetime(breaks = "1 year", 
+               labels = scales::date_format("%Y")) + 
+    labs(x = "Fecha (año)", y = "Valor de la leche") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+En este se observa que el precio de la leche muestra una tendencia ascendente, la cual es reproducida correctamente por el modelo. De forma complementaria, es necesario calcular algunos parámetros claves de la modelación: el coeficiente de determinación (r cuadrado) y el error cuadrático medio (RMSE)
+
+```{r metricas modelo}
+rsq <- function (x, y) cor(x, y) ^ 2
+data.frame(Parámetro = c("R2", "RMSE"),
+           valor = c(rsq(test$Precio_leche, test$Prediccion),
+                     ModelMetrics::rmse(test$Precio_leche, test$Prediccion)))
+```
+
+En cuanto a la evaluación de los resultados, me parece que para ser un ejercicio los ajustes alcanzados son bastante buenos, considerando especialmente un error cuadrático medio de 14.6 pesos y que por tanto es un buen caso a seguir desarrollando de manera de entender cuál es la relación con los distintos predictores, probar otros algoritmos de selección de variables y de modelación.
+
+De haber tenido un poco más de tiempo, me hubiese gustado incorporar como variable predictora a la temperatura del aire de la zona productora, en especial las temperaturas extremas dado que pueden afectar tanto al crecimiento de los pastizales como al desarrollo y condición de las vacas. Asi mismo, me gustaría investigar sobre otros factores que podrían influir y evaluar la posibilidad de incluirlos  
+
+Finalmente, encontré muy interesante asociar el valor de un alimento básico a variables económicas y ambientales. Ante los distintos escenarios de cambio climático que se proyectan se podría generar una predicción del precio de la leche que considere las proyecciones de precipitaciones, temperaturas y precio de los combustibles fósiles.
